@@ -1,56 +1,149 @@
 import streamlit as st
 import pandas as pd
-import requests
-from dotenv import load_dotenv
+import requests#from dotenv import load_dotenv
 import os
 import json
 import tiktoken  # counts tokens safely
+from dotenv import load_dotenv
 
 from openpyxl import load_workbook
 
+from openpyxl.worksheet.table import Table
 from openpyxl.utils import range_boundaries
 
-def extract_pivot_info_with_data(file_path, sheet_name):
+import zipfile
+import xml.etree.ElementTree as ET
+
+def extract_pivot_metadata_fast(file_path):
     """
-    Extract pivot tables, their data source and underlying data for AI analysis.
-    Returns list of dicts with pivot details and sample data.
+    Extract pivot table metadata (name, source range, source sheet)
+    by reading XML directly from the .xlsx (faster than openpyxl).
+    Returns list of dicts.
     """
-    wb = load_workbook(file_path, data_only=False)
+    pivots = []
+
+    with zipfile.ZipFile(file_path, "r") as z:
+        # Look for pivot cache definitions
+        pivot_cache_files = [
+            f for f in z.namelist() if f.startswith("xl/pivotCache/pivotCacheDefinition")
+        ]
+
+        for cache_file in pivot_cache_files:
+            with z.open(cache_file) as f:
+                tree = ET.parse(f)
+                root = tree.getroot()
+
+                # Namespaces Excel uses
+                ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+                # Try to find worksheet source
+                ws_source = root.find(".//main:cacheSource/main:worksheetSource", ns)
+
+                if ws_source is not None:
+                    pivots.append({
+                        "pivot_name": cache_file.split("/")[-1],  # use filename as ID
+                        "source_sheet": ws_source.attrib.get("sheet", "Unknown"),
+                        "source_range": ws_source.attrib.get("ref", "Unknown"),
+                    })
+                else:
+                    pivots.append({
+                        "pivot_name": cache_file.split("/")[-1],
+                        "source_sheet": "Unknown",
+                        "source_range": "Unknown"
+                    })
+
+    return pivots
+
+
+def extract_table_info(file_path, sheet_name):
+    """
+    Extract defined tables (ListObjects) from a given sheet.
+    Returns list of dicts with table name, range, and sample data.
+    """
+    wb = load_workbook(file_path, data_only=True)
+    if sheet_name not in wb.sheetnames:
+        return []
+
+    ws = wb[sheet_name]
+    table_info = []
+
+    if not hasattr(ws, "tables") or not ws.tables:
+        return []
+
+    for name, table in ws.tables.items():
+        details = {
+            "table_name": name,
+            "table_range": None,
+            "sample_data": None
+        }
+
+        try:
+            # ✅ If table is a Table object
+            if isinstance(table, Table):
+                details["table_range"] = table.ref
+            # ✅ If table is stored as string (just a ref)
+            elif isinstance(table, str):
+                details["table_range"] = table
+            else:
+                details["table_range"] = str(table)
+
+            # ✅ Extract sample data if we have a range
+            if details["table_range"]:
+                min_col, min_row, max_col, max_row = range_boundaries(details["table_range"])
+                rows = []
+                for row in ws.iter_rows(min_row=min_row, max_row=max_row,
+                                        min_col=min_col, max_col=max_col,
+                                        values_only=True):
+                    rows.append(row)
+                if rows:
+                    headers, body = rows[0], rows[1:6]  # keep max 5 rows
+                    df = pd.DataFrame(body, columns=headers)
+                    details["sample_data"] = df.to_dict(orient="records")
+        except Exception as e:
+            details["error"] = str(e)
+
+        table_info.append(details)
+
+    return table_info
+
+
+def extract_pivot_info(file_path, sheet_name):
+    """
+    Extract pivot tables, their data source and range from a given sheet.
+    Returns list of dicts with pivot details. Empty list if no pivots exist.
+    """
+    wb = load_workbook(file_path, data_only=False, read_only=True)  # keep formulas/pivots
     if sheet_name not in wb.sheetnames:
         return []
 
     ws = wb[sheet_name]
     pivot_info = []
+    st.write(ws)
+    st.write(ws._pivots)
+    # ✅ if no pivots, return empty immediately
+    if not hasattr(ws, "_pivots") or not ws._pivots:
+        return []
 
     for pivot in ws._pivots:
-        pivot_details = {
-            "pivot_name": getattr(pivot, "name", "Unnamed Pivot"),
-            "cache_id": pivot.cacheId,
-            "source_range": None,
-            "source_sheet": None,
-            "sample_data": None
-        }
-
-        if pivot.cache and pivot.cache.cacheSource:
-            ws_src = pivot.cache.cacheSource.worksheetSource
-            pivot_details["source_range"] = ws_src.ref
-            pivot_details["source_sheet"] = ws_src.sheet
-
-            # ✅ Read source range as DataFrame
-            if ws_src.sheet in wb.sheetnames and ws_src.ref:
-                src_ws = wb[ws_src.sheet]
-                min_col, min_row, max_col, max_row = range_boundaries(ws_src.ref)
-                data = []
-                for row in src_ws.iter_rows(min_row=min_row, max_row=max_row,
-                                            min_col=min_col, max_col=max_col,
-                                            values_only=True):
-                    data.append(row)
-                if data:
-                    headers, rows = data[0], data[1:6]  # take 5 rows max
-                    df = pd.DataFrame(rows, columns=headers)
-                    pivot_details["sample_data"] = df.to_dict(orient="records")
-
-        pivot_info.append(pivot_details)
+        try:
+            pivot_details = {
+                "pivot_name": getattr(pivot, "name", "Unnamed Pivot"),
+                "cache_id": getattr(pivot, "cacheId", None),
+                "source_range": (
+                    str(pivot.cache.cacheSource.worksheetSource.ref)
+                    if pivot.cache and pivot.cache.cacheSource else "Unknown"
+                ),
+                "source_sheet": (
+                    pivot.cache.cacheSource.worksheetSource.sheet
+                    if pivot.cache and pivot.cache.cacheSource else "Unknown"
+                ),
+            }
+            pivot_info.append(pivot_details)
+        except Exception as e:
+            pivot_info.append({
+                "pivot_name": "Error reading pivot",
+                "error": str(e)
+            })
 
     return pivot_info
 
@@ -142,17 +235,30 @@ if uploaded_file:
         default=None
     )
     
-        # ---- Pivot Analysis ----
-    all_pivots = {}
+    pivots = extract_pivot_metadata_fast(uploaded_file)
+
+    for p in pivots:
+        st.write(p)
+    # ---- Pivot Table Detection ----
+    # st.subheader("📊 Pivot Tables in Selected Sheets")
+    # for sheet in (selected_sheets if selected_sheets else sheet_names):
+    #     pivots = extract_pivot_info(uploaded_file, sheet)
+    #     with st.expander(f"Pivot Info in {sheet}", expanded=False):
+    #         if pivots:
+    #             df_pivots = pd.DataFrame(pivots)
+    #             st.dataframe(df_pivots, use_container_width=True)
+    #         else:
+    #             st.info("No Pivot Tables found in this sheet")
+    
+    # ---- Table Analysis ----
+    all_tables = {}
     for sheet in (selected_sheets if selected_sheets else sheet_names):
         try:
-            pivots = extract_pivot_info_with_data(uploaded_file, sheet)
-            if pivots:
-                all_pivots[sheet] = pivots
+            tables = extract_table_info(uploaded_file, sheet)
+            if tables:
+                all_tables[sheet] = tables
         except Exception as e:
-            st.error(f"Error reading pivots in {sheet}: {e}")
-    
-    
+            st.error(f"Error reading tables in {sheet}: {e}")
 
     # Get headers for selected sheets (or all if none selected)
     unique_headers, headers_by_sheet = extract_unique_headers(uploaded_file, selected_sheets)
@@ -224,24 +330,26 @@ if uploaded_file:
 
     data_payload = {
         "workbook_summary": workbook_summary,
-        "pivots": all_pivots
+        "pivots": all_pivots,
+        "tables": all_tables
     }
     data_str = json.dumps(data_payload, default=str)
-    
+
     # ---------- Default Initial Prompt ----------
     if st.button("Get Initial AI Analysis"):
         user_prompt = {
-    "role": "user",
-    "content": (
-        "Here is a preview of an Excel workbook with metadata and pivot tables.\n\n"
-        f"{data_str}\n\n"
-        "Please:\n"
-        "- Summarize workbook structure (sheets, rows, columns)\n"
-        "- Describe detected pivot tables, their source ranges, and what they indicate based on sample data\n"
-        "- Provide 2–3 possible business insights from pivots\n"
-        "⚠️ Keep answer under 250 words."
-    ),
-    }
+            "role": "user",
+            "content": (
+                "Here is a minimal preview of an Excel workbook with multiple sheets. "
+                "Only metadata (rows/cols, first 3 columns) and 1 sample row per sheet are included.\n\n"
+                f"{data_str}\n\n"
+                "Please:\n"
+                "- Summarize workbook structure (sheets, rows, columns)\n"
+                "- Suggest possible next analysis steps\n"
+                "- Give 3 high-level business insights\n"
+                "⚠️ Keep answer under 200 words."
+            ),
+        }
 
         st.session_state.messages = [
             {"role": "system", "content": "You are an expert data analyst."},
