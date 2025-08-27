@@ -6,6 +6,34 @@ import os
 import json
 import tiktoken  # counts tokens safely
 
+from openpyxl import load_workbook
+
+def extract_pivot_info(file_path, sheet_name):
+    """
+    Extract pivot tables, their data source and range from a given sheet.
+    Returns list of dicts with pivot details.
+    """
+    wb = load_workbook(file_path, data_only=False)  # keep formulas/pivots
+    if sheet_name not in wb.sheetnames:
+        return []
+
+    ws = wb[sheet_name]
+    pivot_info = []
+
+    for pivot in ws._pivots:  # internal openpyxl list of pivots
+        pivot_details = {
+            "pivot_name": getattr(pivot, "name", "Unnamed Pivot"),
+            "cache_id": pivot.cacheId,
+            "source_range": str(pivot.cache.cacheSource.worksheetSource.ref) 
+                            if pivot.cache and pivot.cache.cacheSource else "Unknown",
+            "source_sheet": pivot.cache.cacheSource.worksheetSource.sheet 
+                            if pivot.cache and pivot.cache.cacheSource else "Unknown"
+        }
+        pivot_info.append(pivot_details)
+
+    return pivot_info
+
+
 # Load API key
 load_dotenv()
 API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -92,6 +120,17 @@ if uploaded_file:
         default=None
     )
     
+    # ---- Pivot Table Detection ----
+    st.subheader("📊 Pivot Tables in Selected Sheets")
+    for sheet in (selected_sheets if selected_sheets else sheet_names):
+        pivots = extract_pivot_info(uploaded_file, sheet)
+        with st.expander(f"Pivot Info in {sheet}", expanded=False):
+            if pivots:
+                df_pivots = pd.DataFrame(pivots)
+                st.dataframe(df_pivots, use_container_width=True)
+            else:
+                st.info("No Pivot Tables found in this sheet")
+
     # Get headers for selected sheets (or all if none selected)
     unique_headers, headers_by_sheet = extract_unique_headers(uploaded_file, selected_sheets)
 
