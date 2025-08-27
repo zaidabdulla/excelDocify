@@ -8,30 +8,52 @@ import tiktoken  # counts tokens safely
 
 from openpyxl import load_workbook
 
-def extract_pivot_info(file_path, sheet_name):
+from openpyxl.utils import range_boundaries
+
+def extract_pivot_info_with_data(file_path, sheet_name):
     """
-    Extract pivot tables, their data source and range from a given sheet.
-    Returns list of dicts with pivot details.
+    Extract pivot tables, their data source and underlying data for AI analysis.
+    Returns list of dicts with pivot details and sample data.
     """
-    wb = load_workbook(file_path, data_only=False)  # keep formulas/pivots
+    wb = load_workbook(file_path, data_only=False)
     if sheet_name not in wb.sheetnames:
         return []
 
     ws = wb[sheet_name]
     pivot_info = []
 
-    for pivot in ws._pivots:  # internal openpyxl list of pivots
+    for pivot in ws._pivots:
         pivot_details = {
             "pivot_name": getattr(pivot, "name", "Unnamed Pivot"),
             "cache_id": pivot.cacheId,
-            "source_range": str(pivot.cache.cacheSource.worksheetSource.ref) 
-                            if pivot.cache and pivot.cache.cacheSource else "Unknown",
-            "source_sheet": pivot.cache.cacheSource.worksheetSource.sheet 
-                            if pivot.cache and pivot.cache.cacheSource else "Unknown"
+            "source_range": None,
+            "source_sheet": None,
+            "sample_data": None
         }
+
+        if pivot.cache and pivot.cache.cacheSource:
+            ws_src = pivot.cache.cacheSource.worksheetSource
+            pivot_details["source_range"] = ws_src.ref
+            pivot_details["source_sheet"] = ws_src.sheet
+
+            # ✅ Read source range as DataFrame
+            if ws_src.sheet in wb.sheetnames and ws_src.ref:
+                src_ws = wb[ws_src.sheet]
+                min_col, min_row, max_col, max_row = range_boundaries(ws_src.ref)
+                data = []
+                for row in src_ws.iter_rows(min_row=min_row, max_row=max_row,
+                                            min_col=min_col, max_col=max_col,
+                                            values_only=True):
+                    data.append(row)
+                if data:
+                    headers, rows = data[0], data[1:6]  # take 5 rows max
+                    df = pd.DataFrame(rows, columns=headers)
+                    pivot_details["sample_data"] = df.to_dict(orient="records")
+
         pivot_info.append(pivot_details)
 
     return pivot_info
+
 
 
 # Load API key
@@ -120,16 +142,17 @@ if uploaded_file:
         default=None
     )
     
-    # ---- Pivot Table Detection ----
-    st.subheader("📊 Pivot Tables in Selected Sheets")
+        # ---- Pivot Analysis ----
+    all_pivots = {}
     for sheet in (selected_sheets if selected_sheets else sheet_names):
-        pivots = extract_pivot_info(uploaded_file, sheet)
-        with st.expander(f"Pivot Info in {sheet}", expanded=False):
+        try:
+            pivots = extract_pivot_info_with_data(uploaded_file, sheet)
             if pivots:
-                df_pivots = pd.DataFrame(pivots)
-                st.dataframe(df_pivots, use_container_width=True)
-            else:
-                st.info("No Pivot Tables found in this sheet")
+                all_pivots[sheet] = pivots
+        except Exception as e:
+            st.error(f"Error reading pivots in {sheet}: {e}")
+    
+    
 
     # Get headers for selected sheets (or all if none selected)
     unique_headers, headers_by_sheet = extract_unique_headers(uploaded_file, selected_sheets)
@@ -199,21 +222,26 @@ if uploaded_file:
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
+    data_payload = {
+        "workbook_summary": workbook_summary,
+        "pivots": all_pivots
+    }
+    data_str = json.dumps(data_payload, default=str)
+    
     # ---------- Default Initial Prompt ----------
     if st.button("Get Initial AI Analysis"):
         user_prompt = {
-            "role": "user",
-            "content": (
-                "Here is a minimal preview of an Excel workbook with multiple sheets. "
-                "Only metadata (rows/cols, first 3 columns) and 1 sample row per sheet are included.\n\n"
-                f"{data_str}\n\n"
-                "Please:\n"
-                "- Summarize workbook structure (sheets, rows, columns)\n"
-                "- Suggest possible next analysis steps\n"
-                "- Give 3 high-level business insights\n"
-                "⚠️ Keep answer under 200 words."
-            ),
-        }
+    "role": "user",
+    "content": (
+        "Here is a preview of an Excel workbook with metadata and pivot tables.\n\n"
+        f"{data_str}\n\n"
+        "Please:\n"
+        "- Summarize workbook structure (sheets, rows, columns)\n"
+        "- Describe detected pivot tables, their source ranges, and what they indicate based on sample data\n"
+        "- Provide 2–3 possible business insights from pivots\n"
+        "⚠️ Keep answer under 250 words."
+    ),
+    }
 
         st.session_state.messages = [
             {"role": "system", "content": "You are an expert data analyst."},
