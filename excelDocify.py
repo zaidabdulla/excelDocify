@@ -77,45 +77,60 @@ def extract_pivots_for_sheet(file_obj, target_sheet_name):
     return pivots
 
 
+import zipfile
+import xml.etree.ElementTree as ET
+
 def extract_pivot_metadata_fast(file_path):
     """
-    Extract pivot table metadata (name, source range, source sheet)
+    Extract pivot table metadata (pivot name, source range, source sheet)
     by reading XML directly from the .xlsx (faster than openpyxl).
-    Returns list of dicts.
+    Returns (list of dicts, combined_text).
     """
     pivots = []
 
     with zipfile.ZipFile(file_path, "r") as z:
-        # Look for pivot cache definitions
+        ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+        # 🔹 Step 1: Map pivotCacheId -> pivotTable name
+        pivot_name_map = {}
+        pivot_table_files = [f for f in z.namelist() if f.startswith("xl/pivotTables/pivotTable")]
+        for pt_file in pivot_table_files:
+            with z.open(pt_file) as f:
+                tree = ET.parse(f)
+                root = tree.getroot()
+                pivot_name = root.attrib.get("name", pt_file.split("/")[-1])
+                cache_id = root.attrib.get("cacheId")  # links to pivotCacheDefinition
+                if cache_id:
+                    pivot_name_map[cache_id] = pivot_name
+
+        # 🔹 Step 2: Read pivotCacheDefinitions (source info)
         pivot_cache_files = [
             f for f in z.namelist() if f.startswith("xl/pivotCache/pivotCacheDefinition")
         ]
 
-        for cache_file in pivot_cache_files:
+        for idx, cache_file in enumerate(pivot_cache_files, start=1):
             with z.open(cache_file) as f:
                 tree = ET.parse(f)
                 root = tree.getroot()
 
-                # Namespaces Excel uses
-                ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-
-                # Try to find worksheet source
                 ws_source = root.find(".//main:cacheSource/main:worksheetSource", ns)
 
-                if ws_source is not None:
-                    pivots.append({
-                        "pivot_name": cache_file.split("/")[-1],  # use filename as ID
-                        "source_sheet": ws_source.attrib.get("sheet", "Unknown"),
-                        "source_range": ws_source.attrib.get("ref", "Unknown"),
-                    })
-                else:
-                    pivots.append({
-                        "pivot_name": cache_file.split("/")[-1],
-                        "source_sheet": "Unknown",
-                        "source_range": "Unknown"
-                    })
+                cache_id = str(idx)  # pivot caches are usually 1-based indexed
+                pivot_name = pivot_name_map.get(cache_id, f"Pivot_{idx}")
 
-    return pivots
+                pivots.append({
+                    "pivot_name": pivot_name,
+                    "source_sheet": ws_source.attrib.get("sheet", "Unknown") if ws_source is not None else "Unknown",
+                    "source_range": ws_source.attrib.get("ref", "Unknown") if ws_source is not None else "Unknown",
+                })
+
+    # 🔹 Step 3: Combine into single string for OpenAI
+    combined_text = "\n".join(
+        [f"- {p['pivot_name']} (Sheet: {p['source_sheet']}, Range: {p['source_range']})" for p in pivots]
+    )
+
+    return pivots, combined_text
+
 
 
 def extract_table_info(file_path, sheet_name):
@@ -298,13 +313,13 @@ if uploaded_file:
         default=None
     )
     
-    pivots = extract_pivots_for_sheet(uploaded_file, selected_sheet)
-    st.write(pivots)
+    #pivots = extract_pivots_for_sheet(uploaded_file, selected_sheets)
+    #st.write(pivots)
 
-    pivots = extract_pivot_metadata_fast(uploaded_file)
+    pivots, text_for_ai = extract_pivot_metadata_fast(uploaded_file)
 
-    for p in pivots:
-        st.write(p)
+    print("Extracted Pivots:", pivots)
+    print("\nCombined Summary for AI:\n", text_for_ai)
     # ---- Pivot Table Detection ----
     # st.subheader("📊 Pivot Tables in Selected Sheets")
     # for sheet in (selected_sheets if selected_sheets else sheet_names):
