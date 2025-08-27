@@ -14,6 +14,69 @@ from openpyxl.utils import range_boundaries
 import zipfile
 import xml.etree.ElementTree as ET
 
+def extract_pivots_for_sheet(file_obj, target_sheet_name):
+    """
+    Extract pivot metadata (name, source range, source sheet)
+    but only for the given sheet.
+    """
+    pivots = []
+    file_obj.seek(0)
+
+    with zipfile.ZipFile(file_obj, "r") as z:
+        # 1. Map sheetId -> sheetName
+        sheet_map = {}
+        with z.open("xl/workbook.xml") as f:
+            tree = ET.parse(f)
+            root = tree.getroot()
+            ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+            for idx, sheet in enumerate(root.findall(".//main:sheets/main:sheet", ns), start=1):
+                sheet_map[sheet.attrib["name"]] = idx  # sheetN.xml uses 1-based index
+
+        if target_sheet_name not in sheet_map:
+            return []
+
+        sheet_idx = sheet_map[target_sheet_name]
+        sheet_rels = f"xl/worksheets/_rels/sheet{sheet_idx}.xml.rels"
+
+        if sheet_rels not in z.namelist():
+            return []
+
+        # 2. Read rels to find linked pivotTable XMLs
+        with z.open(sheet_rels) as f:
+            tree = ET.parse(f)
+            root = tree.getroot()
+            ns_rel = {"rel": "http://schemas.openxmlformats.org/package/2006/relationships"}
+            pivot_targets = [
+                rel.attrib["Target"].replace("..", "xl")
+                for rel in root.findall(".//rel:Relationship[@Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable']", ns_rel)
+            ]
+
+        # 3. For each pivot table, read its definition
+        for pivot_xml in pivot_targets:
+            with z.open(pivot_xml) as f:
+                tree = ET.parse(f)
+                root = tree.getroot()
+                ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+                cache_id = root.attrib.get("cacheId")
+
+            # 4. Find corresponding cache definition
+            cache_file = f"xl/pivotCache/pivotCacheDefinition{cache_id}.xml"
+            if cache_file in z.namelist():
+                with z.open(cache_file) as f:
+                    tree = ET.parse(f)
+                    root = tree.getroot()
+                    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+                    ws_source = root.find(".//main:cacheSource/main:worksheetSource", ns)
+
+                    pivots.append({
+                        "pivot_name": pivot_xml.split("/")[-1],
+                        "source_sheet": ws_source.attrib.get("sheet", "Unknown") if ws_source is not None else "Unknown",
+                        "source_range": ws_source.attrib.get("ref", "Unknown") if ws_source is not None else "Unknown",
+                    })
+
+    return pivots
+
+
 def extract_pivot_metadata_fast(file_path):
     """
     Extract pivot table metadata (name, source range, source sheet)
@@ -235,6 +298,9 @@ if uploaded_file:
         default=None
     )
     
+    pivots = extract_pivots_for_sheet(uploaded_file, selected_sheet)
+    st.write(pivots)
+
     pivots = extract_pivot_metadata_fast(uploaded_file)
 
     for p in pivots:
