@@ -133,56 +133,64 @@ def extract_pivot_metadata_fast(file_path):
 
 
 
-def extract_table_info(file_path, sheet_name):
+import zipfile
+import xml.etree.ElementTree as ET
+
+def extract_table_metadata(file_path):
     """
-    Extract defined tables (ListObjects) from a given sheet.
-    Returns list of dicts with table name, range, and sample data.
+    Extract Excel table metadata:
+    - Table name
+    - Table range
+    - Table sheet name
+    Returns (list of dicts, combined_text).
     """
-    wb = load_workbook(file_path, data_only=True)
-    if sheet_name not in wb.sheetnames:
-        return []
+    tables = []
 
-    ws = wb[sheet_name]
-    table_info = []
+    with zipfile.ZipFile(file_path, "r") as z:
+        ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 
-    if not hasattr(ws, "tables") or not ws.tables:
-        return []
+        # Step 1: Map tableId -> sheet name (from worksheet.xml.rels)
+        table_sheet_map = {}
+        sheet_files = [f for f in z.namelist() if f.startswith("xl/worksheets/sheet") and f.endswith(".xml")]
+        rel_files = [f for f in z.namelist() if f.startswith("xl/worksheets/_rels/sheet") and f.endswith(".xml.rels")]
 
-    for name, table in ws.tables.items():
-        details = {
-            "table_name": name,
-            "table_range": None,
-            "sample_data": None
-        }
+        # Map rel -> sheet
+        for sheet_file, rel_file in zip(sheet_files, rel_files):
+            sheet_name = sheet_file.split("/")[-1].replace(".xml", "")
+            with z.open(rel_file) as f:
+                tree = ET.parse(f)
+                root = tree.getroot()
+                for rel in root.findall(".//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship"):
+                    target = rel.attrib.get("Target", "")
+                    if "tables/table" in target:
+                        table_id = target.split("table")[-1].split(".xml")[0]
+                        table_sheet_map[table_id] = sheet_name
 
-        try:
-            # ✅ If table is a Table object
-            if isinstance(table, Table):
-                details["table_range"] = table.ref
-            # ✅ If table is stored as string (just a ref)
-            elif isinstance(table, str):
-                details["table_range"] = table
-            else:
-                details["table_range"] = str(table)
+        # Step 2: Extract table definitions
+        table_files = [f for f in z.namelist() if f.startswith("xl/tables/table")]
 
-            # ✅ Extract sample data if we have a range
-            if details["table_range"]:
-                min_col, min_row, max_col, max_row = range_boundaries(details["table_range"])
-                rows = []
-                for row in ws.iter_rows(min_row=min_row, max_row=max_row,
-                                        min_col=min_col, max_col=max_col,
-                                        values_only=True):
-                    rows.append(row)
-                if rows:
-                    headers, body = rows[0], rows[1:6]  # keep max 5 rows
-                    df = pd.DataFrame(body, columns=headers)
-                    details["sample_data"] = df.to_dict(orient="records")
-        except Exception as e:
-            details["error"] = str(e)
+        for tfile in table_files:
+            table_id = tfile.split("table")[-1].split(".xml")[0]
+            with z.open(tfile) as f:
+                tree = ET.parse(f)
+                root = tree.getroot()
+                table_name = root.attrib.get("name", f"Table_{table_id}")
+                table_range = root.attrib.get("ref", "Unknown")
+                table_sheet = table_sheet_map.get(table_id, "Unknown")
 
-        table_info.append(details)
+                tables.append({
+                    "table_name": table_name,
+                    "table_range": table_range,
+                    "table_sheet": table_sheet,
+                })
 
-    return table_info
+    # Step 3: Prepare combined text for AI summary
+    combined_text = "\n".join(
+        [f"- {t['table_name']} (Sheet: {t['table_sheet']}, Range: {t['table_range']})"
+         for t in tables]
+    )
+
+    return tables, combined_text
 
 
 def extract_pivot_info(file_path, sheet_name):
@@ -320,26 +328,13 @@ if uploaded_file:
 
     print("Extracted Pivots:", pivots)
     print("\nCombined Summary for AI:\n", text_for_ai)
+ 
     # ---- Pivot Table Detection ----
-    # st.subheader("📊 Pivot Tables in Selected Sheets")
-    # for sheet in (selected_sheets if selected_sheets else sheet_names):
-    #     pivots = extract_pivot_info(uploaded_file, sheet)
-    #     with st.expander(f"Pivot Info in {sheet}", expanded=False):
-    #         if pivots:
-    #             df_pivots = pd.DataFrame(pivots)
-    #             st.dataframe(df_pivots, use_container_width=True)
-    #         else:
-    #             st.info("No Pivot Tables found in this sheet")
+    tables, text_for_ai = extract_table_metadata(uploaded_file)
+
+    print("Extracted Tables:", tables)
+    print("\nCombined Summary for AI:\n", text_for_ai)
     
-    # ---- Table Analysis ----
-    all_tables = {}
-    for sheet in (selected_sheets if selected_sheets else sheet_names):
-        try:
-            tables = extract_table_info(uploaded_file, sheet)
-            if tables:
-                all_tables[sheet] = tables
-        except Exception as e:
-            st.error(f"Error reading tables in {sheet}: {e}")
 
     # Get headers for selected sheets (or all if none selected)
     unique_headers, headers_by_sheet = extract_unique_headers(uploaded_file, selected_sheets)
