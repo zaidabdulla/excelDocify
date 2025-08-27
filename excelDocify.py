@@ -233,6 +233,65 @@ def extract_pivot_info(file_path, sheet_name):
 
     return pivot_info
 
+import zipfile
+import xml.etree.ElementTree as ET
+
+def extract_data_validation_metadata(file_path):
+    """
+    Extract Data Validation rules metadata:
+    - Name (generated from type + formula1)
+    - Type (list, whole, decimal, date, etc.)
+    - Range (sqref)
+    - Sheet name
+    Returns (list of dicts, combined_text).
+    """
+    validations = []
+
+    with zipfile.ZipFile(file_path, "r") as z:
+        ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+        # Get all sheet XMLs
+        sheet_files = [f for f in z.namelist() if f.startswith("xl/worksheets/sheet") and f.endswith(".xml")]
+
+        for sheet_file in sheet_files:
+            sheet_name = sheet_file.split("/")[-1].replace(".xml", "")
+
+            with z.open(sheet_file) as f:
+                tree = ET.parse(f)
+                root = tree.getroot()
+
+                for dv in root.findall(".//main:dataValidation", ns):
+                    dv_type = dv.attrib.get("type", "unknown")
+                    dv_range = dv.attrib.get("sqref", "Unknown")
+                    formula1 = None
+                    formula2 = None
+
+                    f1 = dv.find("main:formula1", ns)
+                    if f1 is not None:
+                        formula1 = f1.text
+                    f2 = dv.find("main:formula2", ns)
+                    if f2 is not None:
+                        formula2 = f2.text
+
+                    # Generate "name" for the rule
+                    rule_name = f"{dv_type}_rule_{formula1 or ''}".strip("_")
+
+                    validations.append({
+                        "rule_name": rule_name,
+                        "rule_type": dv_type,
+                        "range": dv_range,
+                        "sheet": sheet_name,
+                        "formula1": formula1,
+                        "formula2": formula2,
+                    })
+
+    # Combine into text for AI summary
+    combined_text = "\n".join(
+        [f"- {v['rule_name']} (Type: {v['rule_type']}, Sheet: {v['sheet']}, Range: {v['range']}, Formula: {v.get('formula1','')})"
+         for v in validations]
+    )
+
+    return validations, combined_text
 
 
 # Load API key
@@ -321,8 +380,7 @@ if uploaded_file:
         default=None
     )
     
-    #pivots = extract_pivots_for_sheet(uploaded_file, selected_sheets)
-    #st.write(pivots)
+    
 
     pivots, text_for_ai = extract_pivot_metadata_fast(uploaded_file)
 
@@ -335,6 +393,10 @@ if uploaded_file:
     print("Extracted Tables:", tables)
     print("\nCombined Summary for AI:\n", text_for_ai)
     
+    validations, text_for_ai = extract_data_validation_metadata(uploaded_file)
+
+    print("Validation Rules Found:", validations)
+    print("\nCombined Summary for AI:\n", text_for_ai)
 
     # Get headers for selected sheets (or all if none selected)
     unique_headers, headers_by_sheet = extract_unique_headers(uploaded_file, selected_sheets)
