@@ -77,8 +77,6 @@ def extract_pivots_for_sheet(file_obj, target_sheet_name):
     return pivots
 
 
-import zipfile
-import xml.etree.ElementTree as ET
 
 def extract_pivot_metadata_fast(file_path):
     """
@@ -133,8 +131,6 @@ def extract_pivot_metadata_fast(file_path):
 
 
 
-import zipfile
-import xml.etree.ElementTree as ET
 
 def extract_table_metadata(file_path):
     """
@@ -233,28 +229,45 @@ def extract_pivot_info(file_path, sheet_name):
 
     return pivot_info
 
+
 import zipfile
 import xml.etree.ElementTree as ET
 
 def extract_data_validation_metadata(file_path):
     """
     Extract Data Validation rules metadata:
-    - Name (generated from type + formula1)
-    - Type (list, whole, decimal, date, etc.)
+    - Rule name
+    - Rule type (list, whole, decimal, date, etc.)
+    - Operator (between, equal, lessThan, etc.)
+    - Criteria (interpreted from formula1 & formula2)
     - Range (sqref)
-    - Sheet name
-    Returns (list of dicts, combined_text).
+    - Sheet name (actual Excel name, not sheet1.xml)
+    Returns: (list of dicts, combined_text).
     """
     validations = []
 
     with zipfile.ZipFile(file_path, "r") as z:
         ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 
-        # Get all sheet XMLs
+        # 1️⃣ Parse workbook.xml to get real sheet names
+        sheet_id_map = {}
+        with z.open("xl/workbook.xml") as f:
+            tree = ET.parse(f)
+            root = tree.getroot()
+
+            for sheet in root.findall(".//main:sheets/main:sheet", ns):
+                sheet_id = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                sheet_name = sheet.attrib.get("name")
+                sheet_rid = sheet.attrib.get("sheetId")
+                sheet_id_map[sheet_rid] = sheet_name
+
+        # 2️⃣ Now read worksheets and map them back
         sheet_files = [f for f in z.namelist() if f.startswith("xl/worksheets/sheet") and f.endswith(".xml")]
 
         for sheet_file in sheet_files:
-            sheet_name = sheet_file.split("/")[-1].replace(".xml", "")
+            # Extract numeric sheet index (sheet1.xml → "1")
+            sheet_index = sheet_file.split("/")[-1].replace("sheet", "").replace(".xml", "")
+            sheet_name = sheet_id_map.get(sheet_index, f"Sheet{sheet_index}")
 
             with z.open(sheet_file) as f:
                 tree = ET.parse(f)
@@ -263,38 +276,66 @@ def extract_data_validation_metadata(file_path):
                 for dv in root.findall(".//main:dataValidation", ns):
                     dv_type = dv.attrib.get("type", "unknown")
                     dv_range = dv.attrib.get("sqref", "Unknown")
-                    formula1 = None
-                    formula2 = None
+                    operator = dv.attrib.get("operator", None)
 
+                    # Extract formulas
                     f1 = dv.find("main:formula1", ns)
-                    if f1 is not None:
-                        formula1 = f1.text
                     f2 = dv.find("main:formula2", ns)
-                    if f2 is not None:
-                        formula2 = f2.text
+                    formula1 = f1.text if f1 is not None else None
+                    formula2 = f2.text if f2 is not None else None
+
+                    # Build readable criteria
+                    criteria = None
+                    if dv_type in ["whole", "decimal", "date", "time"]:
+                        if operator == "between":
+                            criteria = f"Value between {formula1} and {formula2}"
+                        elif operator == "notBetween":
+                            criteria = f"Value not between {formula1} and {formula2}"
+                        elif operator == "equal":
+                            criteria = f"Value = {formula1}"
+                        elif operator == "notEqual":
+                            criteria = f"Value ≠ {formula1}"
+                        elif operator == "lessThan":
+                            criteria = f"Value < {formula1}"
+                        elif operator == "lessThanOrEqual":
+                            criteria = f"Value ≤ {formula1}"
+                        elif operator == "greaterThan":
+                            criteria = f"Value > {formula1}"
+                        elif operator == "greaterThanOrEqual":
+                            criteria = f"Value ≥ {formula1}"
+                        else:
+                            criteria = f"Formula1={formula1}, Formula2={formula2}"
+                    elif dv_type == "list":
+                        criteria = f"Allowed values from list: {formula1}"
+                    elif dv_type == "custom":
+                        criteria = f"Custom formula: {formula1}"
+                    else:
+                        criteria = f"Formula1={formula1}, Formula2={formula2}"
 
                     # Generate "name" for the rule
-                    rule_name = f"{dv_type}_rule_{formula1 or ''}".strip("_")
+                    rule_name = f"{dv_type}_{operator or ''}_{formula1 or ''}".strip("_")
 
                     validations.append({
                         "rule_name": rule_name,
                         "rule_type": dv_type,
+                        "operator": operator,
                         "range": dv_range,
-                        "sheet": sheet_name,
+                        "sheet": sheet_name,  # ✅ Real Excel sheet name
                         "formula1": formula1,
                         "formula2": formula2,
+                        "criteria": criteria
                     })
 
     # Combine into text for AI summary
     combined_text = "\n".join(
-        [f"- {v['rule_name']} (Type: {v['rule_type']}, Sheet: {v['sheet']}, Range: {v['range']}, Formula: {v.get('formula1','')})"
+        [f"- {v['rule_name']} (Type: {v['rule_type']}, Operator: {v['operator']}, "
+         f"Sheet: {v['sheet']}, Range: {v['range']}, Criteria: {v['criteria']})"
          for v in validations]
     )
 
     return validations, combined_text
 
-import zipfile
-import xml.etree.ElementTree as ET
+
 
 def extract_chart_metadata(file_path):
     """
