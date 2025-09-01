@@ -14,69 +14,13 @@ from openpyxl.utils import range_boundaries
 import zipfile
 import xml.etree.ElementTree as ET
 
-def extract_pivots_for_sheet(file_obj, target_sheet_name):
-    """
-    Extract pivot metadata (name, source range, source sheet)
-    but only for the given sheet.
-    """
-    pivots = []
-    file_obj.seek(0)
+# Load API key
+load_dotenv()
+API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-    with zipfile.ZipFile(file_obj, "r") as z:
-        # 1. Map sheetId -> sheetName
-        sheet_map = {}
-        with z.open("xl/workbook.xml") as f:
-            tree = ET.parse(f)
-            root = tree.getroot()
-            ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-            for idx, sheet in enumerate(root.findall(".//main:sheets/main:sheet", ns), start=1):
-                sheet_map[sheet.attrib["name"]] = idx  # sheetN.xml uses 1-based index
+BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-        if target_sheet_name not in sheet_map:
-            return []
-
-        sheet_idx = sheet_map[target_sheet_name]
-        sheet_rels = f"xl/worksheets/_rels/sheet{sheet_idx}.xml.rels"
-
-        if sheet_rels not in z.namelist():
-            return []
-
-        # 2. Read rels to find linked pivotTable XMLs
-        with z.open(sheet_rels) as f:
-            tree = ET.parse(f)
-            root = tree.getroot()
-            ns_rel = {"rel": "http://schemas.openxmlformats.org/package/2006/relationships"}
-            pivot_targets = [
-                rel.attrib["Target"].replace("..", "xl")
-                for rel in root.findall(".//rel:Relationship[@Type='http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable']", ns_rel)
-            ]
-
-        # 3. For each pivot table, read its definition
-        for pivot_xml in pivot_targets:
-            with z.open(pivot_xml) as f:
-                tree = ET.parse(f)
-                root = tree.getroot()
-                ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-                cache_id = root.attrib.get("cacheId")
-
-            # 4. Find corresponding cache definition
-            cache_file = f"xl/pivotCache/pivotCacheDefinition{cache_id}.xml"
-            if cache_file in z.namelist():
-                with z.open(cache_file) as f:
-                    tree = ET.parse(f)
-                    root = tree.getroot()
-                    ns = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-                    ws_source = root.find(".//main:cacheSource/main:worksheetSource", ns)
-
-                    pivots.append({
-                        "pivot_name": pivot_xml.split("/")[-1],
-                        "source_sheet": ws_source.attrib.get("sheet", "Unknown") if ws_source is not None else "Unknown",
-                        "source_range": ws_source.attrib.get("ref", "Unknown") if ws_source is not None else "Unknown",
-                    })
-
-    return pivots
-
-
+st.title("📊 Excel to AI Insights (OpenRouter)")
 
 def extract_pivot_metadata_fast(file_path):
     """
@@ -128,9 +72,6 @@ def extract_pivot_metadata_fast(file_path):
     )
 
     return pivots, combined_text
-
-
-
 
 def extract_table_metadata(file_path):
     """
@@ -187,51 +128,6 @@ def extract_table_metadata(file_path):
     )
 
     return tables, combined_text
-
-
-def extract_pivot_info(file_path, sheet_name):
-    """
-    Extract pivot tables, their data source and range from a given sheet.
-    Returns list of dicts with pivot details. Empty list if no pivots exist.
-    """
-    wb = load_workbook(file_path, data_only=False, read_only=True)  # keep formulas/pivots
-    if sheet_name not in wb.sheetnames:
-        return []
-
-    ws = wb[sheet_name]
-    pivot_info = []
-    st.write(ws)
-    st.write(ws._pivots)
-    # ✅ if no pivots, return empty immediately
-    if not hasattr(ws, "_pivots") or not ws._pivots:
-        return []
-
-    for pivot in ws._pivots:
-        try:
-            pivot_details = {
-                "pivot_name": getattr(pivot, "name", "Unnamed Pivot"),
-                "cache_id": getattr(pivot, "cacheId", None),
-                "source_range": (
-                    str(pivot.cache.cacheSource.worksheetSource.ref)
-                    if pivot.cache and pivot.cache.cacheSource else "Unknown"
-                ),
-                "source_sheet": (
-                    pivot.cache.cacheSource.worksheetSource.sheet
-                    if pivot.cache and pivot.cache.cacheSource else "Unknown"
-                ),
-            }
-            pivot_info.append(pivot_details)
-        except Exception as e:
-            pivot_info.append({
-                "pivot_name": "Error reading pivot",
-                "error": str(e)
-            })
-
-    return pivot_info
-
-
-import zipfile
-import xml.etree.ElementTree as ET
 
 def extract_data_validation_metadata(file_path):
     """
@@ -334,8 +230,6 @@ def extract_data_validation_metadata(file_path):
     )
 
     return validations, combined_text
-
-
 
 def extract_chart_metadata(file_path):
     """
@@ -448,15 +342,6 @@ def extract_chart_metadata(file_path):
     )
 
     return charts, combined_text
-
-
-# Load API key
-load_dotenv()
-API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-st.title("📊 Excel to AI Insights (OpenRouter)")
 
 def get_excel_column_letter(col_idx):
     """Convert column index to Excel column letter (e.g., 0='A', 1='B', 26='AA')"""
@@ -629,8 +514,8 @@ if uploaded_file:
 
     data_payload = {
         "workbook_summary": workbook_summary,
-        "pivots": all_pivots,
-        "tables": all_tables
+        "pivots": pivots,
+        "tables": tables
     }
     data_str = json.dumps(data_payload, default=str)
 
