@@ -231,117 +231,143 @@ def extract_data_validation_metadata(file_path):
 
     return validations, combined_text
 
+import zipfile
+import xml.etree.ElementTree as ET
+
 def extract_chart_metadata(file_path):
     """
     Extract chart metadata (chart type, title, sheet name).
     Returns (list of dicts, combined_text).
     """
+
     charts = []
 
+    ns = {
+        "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+        "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    }
+
     with zipfile.ZipFile(file_path, "r") as z:
-        ns = {
-            "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-            "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-            "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
-            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-        }
 
-        # map drawings to sheets
+        # --- Step 1: Get sheet name mapping ---
+        sheet_name_map = {}
+        if "xl/workbook.xml" in z.namelist():
+            wb_tree = ET.parse(z.open("xl/workbook.xml"))
+            wb_root = wb_tree.getroot()
+
+            # open workbook rels
+            wb_rels = {}
+            if "xl/_rels/workbook.xml.rels" in z.namelist():
+                wb_rel_tree = ET.parse(z.open("xl/_rels/workbook.xml.rels"))
+                for r in wb_rel_tree.findall(".//", {"": "http://schemas.openxmlformats.org/package/2006/relationships"}):
+                    if "Id" in r.attrib and "Target" in r.attrib:
+                        wb_rels[r.attrib["Id"]] = r.attrib["Target"]
+
+            for sheet in wb_root.findall(".//main:sheet", ns):
+                name = sheet.attrib.get("name")
+                rId = sheet.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                if rId in wb_rels:
+                    target = wb_rels[rId].replace("../", "xl/")
+                    sheet_name_map[target] = name
+
+        # --- Step 2: Loop through sheets ---
         sheet_files = [f for f in z.namelist() if f.startswith("xl/worksheets/sheet") and f.endswith(".xml")]
-        rels = {f: f.replace("worksheets", "worksheets/_rels") + ".rels" for f in sheet_files}
-
         for sheet_file in sheet_files:
-            sheet_name = sheet_file.split("/")[-1].replace(".xml", "")
+            sheet_name = sheet_name_map.get(sheet_file, sheet_file.split("/")[-1].replace(".xml", ""))
 
-            # open worksheet XML
-            with z.open(sheet_file) as f:
-                tree = ET.parse(f)
-                root = tree.getroot()
+            # parse sheet xml
+            tree = ET.parse(z.open(sheet_file))
+            root = tree.getroot()
 
-                # Look for <drawing r:id="rIdX">
-                drawing_elems = root.findall(".//main:drawing", ns)
-                if not drawing_elems:
+            drawing_elems = root.findall(".//main:drawing", ns)
+            if not drawing_elems:
+                continue
+
+            # --- Step 3: Open sheet relationships ---
+            rel_file = sheet_file.replace("worksheets/", "worksheets/_rels/") + ".rels"
+            if rel_file not in z.namelist():
+                continue
+
+            rel_tree = ET.parse(z.open(rel_file))
+            rel_map = {
+                r.attrib["Id"]: r.attrib["Target"]
+                for r in rel_tree.findall(".//", {"": "http://schemas.openxmlformats.org/package/2006/relationships"})
+                if "Id" in r.attrib
+            }
+
+            # --- Step 4: Find drawings that point to charts ---
+            for d in drawing_elems:
+                rId = d.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+                if not rId or rId not in rel_map:
                     continue
 
-                # open sheet relationships
-                rel_file = rels[sheet_file]
-                if rel_file not in z.namelist():
+                drawing_target = rel_map[rId]
+                drawing_target = "xl/" + drawing_target.lstrip("/").replace("../", "")
+                if drawing_target not in z.namelist():
                     continue
-                with z.open(rel_file) as rf:
-                    rel_tree = ET.parse(rf)
-                    rel_root = rel_tree.getroot()
 
-                    # map rId -> target
-                    rel_map = {
+                d_tree = ET.parse(z.open(drawing_target))
+                for c_elem in d_tree.findall(".//c:chart", ns):
+                    c_rId = c_elem.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+
+                    # open drawing rels
+                    d_rel_file = drawing_target.replace("drawings/", "drawings/_rels/") + ".rels"
+                    if d_rel_file not in z.namelist():
+                        continue
+                    dr_tree = ET.parse(z.open(d_rel_file))
+                    chart_map = {
                         r.attrib["Id"]: r.attrib["Target"]
-                        for r in rel_root.findall(".//", {"": "http://schemas.openxmlformats.org/package/2006/relationships"})
+                        for r in dr_tree.findall(".//", {"": "http://schemas.openxmlformats.org/package/2006/relationships"})
                         if "Id" in r.attrib
                     }
 
-                # now resolve drawing -> chart
-                for d in drawing_elems:
-                    rId = d.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
-                    if not rId or rId not in rel_map:
-                        continue
-                    drawing_target = rel_map[rId].replace("..", "xl")
+                    if c_rId in chart_map:
+                        chart_target = "xl/" + chart_map[c_rId].lstrip("/").replace("../", "")
+                        if chart_target not in z.namelist():
+                            continue
 
-                    if drawing_target not in z.namelist():
-                        continue
+                        # --- Step 5: Read chart XML ---
+                        c_tree = ET.parse(z.open(chart_target))
+                        c_root = c_tree.getroot()
 
-                    # read drawing xml
-                    with z.open(drawing_target) as df:
-                        d_tree = ET.parse(df)
-                        d_root = d_tree.getroot()
+                        # chart type
+                        chart_type = "Unknown"
+                        chart_type_map = {
+                            "barChart": "bar/column",
+                            "lineChart": "line",
+                            "pieChart": "pie",
+                            "scatterChart": "scatter",
+                            "areaChart": "area",
+                            "doughnutChart": "doughnut",
+                            "bubbleChart": "bubble",
+                            "radarChart": "radar",
+                            "surfaceChart": "surface",
+                            "stockChart": "stock"
+                        }
 
-                        # look for chart references
-                        for c_elem in d_root.findall(".//c:chart", ns):
-                            c_rId = c_elem.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
-                            # map chart rels
-                            d_rel_file = drawing_target.replace("drawings", "drawings/_rels") + ".rels"
-                            if d_rel_file not in z.namelist():
-                                continue
-                            with z.open(d_rel_file) as drf:
-                                dr_tree = ET.parse(drf)
-                                dr_root = dr_tree.getroot()
-                                chart_map = {
-                                    r.attrib["Id"]: r.attrib["Target"]
-                                    for r in dr_root.findall(".//", {"": "http://schemas.openxmlformats.org/package/2006/relationships"})
-                                    if "Id" in r.attrib
-                                }
+                        for ct, label in chart_type_map.items():
+                            if c_root.find(f".//c:{ct}", ns) is not None:
+                                chart_type = label
+                                break
 
-                            if c_rId in chart_map:
-                                chart_target = "xl/" + chart_map[c_rId].lstrip("/")
-                                if chart_target not in z.namelist():
-                                    continue
+                        # chart title
+                        title_elem = c_root.find(".//c:title//a:t", ns)
+                        chart_title = title_elem.text if title_elem is not None else "Untitled"
 
-                                # open chart XML
-                                with z.open(chart_target) as cf:
-                                    c_tree = ET.parse(cf)
-                                    c_root = c_tree.getroot()
+                        charts.append({
+                            "chart_type": chart_type,
+                            "chart_title": chart_title,
+                            "sheet": sheet_name
+                        })
 
-                                    # detect chart type
-                                    chart_type = "Unknown"
-                                    for ct in ["barChart", "lineChart", "pieChart", "scatterChart", "areaChart"]:
-                                        if c_root.find(f".//c:{ct}", ns) is not None:
-                                            chart_type = ct.replace("Chart", "")
-                                            break
-
-                                    # detect title
-                                    title_elem = c_root.find(".//c:title//a:t", ns)
-                                    chart_title = title_elem.text if title_elem is not None else "Untitled"
-
-                                    charts.append({
-                                        "chart_type": chart_type,
-                                        "chart_title": chart_title,
-                                        "sheet": sheet_name
-                                    })
-
-    # Combine text for OpenAI summary
+    # --- Final Output ---
     combined_text = "\n".join(
         [f"- {c['chart_title']} (Type: {c['chart_type']}, Sheet: {c['sheet']})" for c in charts]
     )
-
     return charts, combined_text
+
 
 def get_excel_column_letter(col_idx):
     """Convert column index to Excel column letter (e.g., 0='A', 1='B', 26='AA')"""
